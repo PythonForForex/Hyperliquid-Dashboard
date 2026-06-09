@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hyperliquid ↔ TradFi Basis Monitor</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#2a3140;
+    --txt:#e6edf3; --dim:#8b949e; --accent:#58a6ff;
+    --green:#3fb950; --red:#f85149; --amber:#d29922; --flash:#243049;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{position:sticky;top:0;z-index:10;background:var(--panel);
+    border-bottom:1px solid var(--line);padding:10px 14px;
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.2px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+    border-radius:999px;font-size:12px;font-weight:600;background:var(--panel2)}
+  .dot{width:8px;height:8px;border-radius:50%}
+  .ok .dot{background:var(--green)} .ok{color:var(--green)}
+  .bad .dot{background:var(--red)} .bad{color:var(--red)}
+  .wait .dot{background:var(--amber)} .wait{color:var(--amber)}
+  .meta{color:var(--dim);font-size:12px}
+  button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+  button:hover{border-color:var(--accent)}
+  button.active{border-color:var(--accent);color:var(--accent)}
+  #banner{display:none;background:#3d2b00;color:#ffd27a;border-bottom:1px solid #5c4400;
+    padding:8px 14px;font-size:12px}
+  #err{color:var(--red);font-size:12px}
+  table{width:100%;border-collapse:collapse}
+  thead th{position:sticky;top:51px;background:var(--panel);z-index:5;
+    text-align:right;padding:7px 10px;font-size:11px;color:var(--dim);
+    text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--line);
+    white-space:nowrap;font-weight:600}
+  thead th.l{text-align:left}
+  tbody td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--panel2);
+    font-variant-numeric:tabular-nums;white-space:nowrap}
+  tbody td.l{text-align:left}
+  tr.grp td{background:var(--panel2);color:var(--accent);font-weight:700;
+    text-transform:uppercase;letter-spacing:.5px;font-size:11px;text-align:left}
+  .sym{font-weight:600}
+  .ref{color:var(--dim);font-size:11.5px;max-width:280px;overflow:hidden;
+    text-overflow:ellipsis}
+  input.refbox{width:96px;background:var(--bg);color:var(--txt);
+    border:1px solid var(--line);border-radius:5px;padding:3px 6px;
+    text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  input.refbox:focus{outline:none;border-color:var(--accent)}
+  .pos{color:var(--green)} .neg{color:var(--red)} .muted{color:var(--dim)}
+  tr.flash td{background:var(--flash);transition:background 0s}
+  tbody td{transition:background .5s ease-out, color .5s ease-out}
+  /* per-cell tick: snap to green (uptick) / red (downtick), then fade out */
+  tbody td.up,tbody td.dn{transition:background 0s, color 0s}
+  tbody td.up{background:rgba(63,185,80,.30);color:var(--green)}
+  tbody td.dn{background:rgba(248,81,73,.30);color:var(--red)}
+  footer{padding:10px 14px;color:var(--dim);font-size:11.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Hyperliquid ↔ TradFi Basis</h1>
+  <span id="status" class="pill wait"><span class="dot"></span><span id="statusTxt">Connecting…</span></span>
+  <span class="meta">Subs: <b id="nSubs">0</b> · Live: <b id="nLive">0</b></span>
+  <span class="meta">Last msg: <b id="lastMsg">—</b></span>
+  <span class="meta" id="diag">acks 0 · books 0</span>
+  <button id="sortBtn">Sort by |Basis %|</button>
+  <span id="err"></span>
+</header>
+<div id="banner"></div>
+<table>
+  <thead><tr>
+    <th class="l">Symbol</th>
+    <th class="l">TradFi Equivalent</th>
+    <th>Bid</th><th>Ask</th><th>Mid</th>
+    <th>Spread</th><th>Spread %</th>
+    <th>TradFi Ref</th><th>Basis %</th>
+    <th>Updated</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<footer>
+  Mid = (bid+ask)/2 · Basis % = (Mid − TradFi Ref)/Ref × 100. Type the matching price
+  from your own broker/TradFi screen into <b>TradFi Ref</b> to see the live dislocation.
+  Data: api.hyperliquid.xyz · top-of-book only.
+</footer>
+
+<script>
+"use strict";
+
+// ---------- config ----------
+var INFO_URL = "https://api.hyperliquid.xyz/info";
+var WS_URL   = "wss://api.hyperliquid.xyz/ws";
+var MAX_SUBS = 300;
+var PING_MS  = 20000;
+
+// ---------- dom helpers ----------
+function $(id){ return document.getElementById(id); }
+function setText(id,t){ var e=$(id); if(e) e.textContent=t; }
+function showErr(m){ $("err").textContent = m ? ("⚠ "+m) : ""; }
+function showBanner(m){ var b=$("banner"); b.textContent=m; b.style.display="block"; }
+
+// ---------- state ----------
+var rows = {};          // id -> {id,name,cat,label,tr,cells,ref,mid}
+var order = [];         // array of ids in discovery order
+var lookup = {};        // normalized coin string -> row id (tolerant matching)
+var ws = null;
+var pingTimer = null;
+var backoff = 1000;
+var sortMode = false;
+var sortTimer = null;
+var diag = {acks:0, books:0, unmatched:{}};  // self-diagnosis counters
+
+function norm(s){ return String(s).toLowerCase().replace(/\s+/g,""); }
+
+// Map every plausible incoming coin string to the row id. Exact (prefixed) id
+// is authoritative; bare name is a fallback only when unambiguous across dexes.
+function buildLookup(){
+  lookup = {};
+  var bareCount = {};
+  order.forEach(function(id){ var b=norm(rows[id].name); bareCount[b]=(bareCount[b]||0)+1; });
+  order.forEach(function(id){
+    lookup[norm(id)] = id;                 // e.g. "xyz:xyz100"
+    var b = norm(rows[id].name);
+    if(bareCount[b]===1 && lookup[b]==null) lookup[b]=id;  // e.g. "xyz100" -> only if unique
+  });
+}
+// Resolve an incoming book coin to a row id, tolerating prefix/case variations.
+function resolveCoin(coin){
+  if(coin==null) return null;
+  var k=norm(coin);
+  if(lookup[k]) return lookup[k];
+  var bare=k.indexOf(":")>=0 ? k.slice(k.indexOf(":")+1) : k;  // strip any dex prefix
+  if(lookup[bare]) return lookup[bare];
+  return null;
+}
+
+// ---------- formatting ----------
+function fmtPx(v){
+  if(v==null||!isFinite(v)) return "—";
+  var a=Math.abs(v), d;
+  if(a>=1000) d=2; else if(a>=100) d=2; else if(a>=10) d=3;
+  else if(a>=1) d=4; else if(a>=0.01) d=5; else d=6;
+  return v.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+}
+function fmtPct(v,dec){
+  if(v==null||!isFinite(v)) return "—";
+  return v.toFixed(dec==null?3:dec)+"%";
+}
+function nowHMS(){
+  var d=new Date();
+  return d.toLocaleTimeString(undefined,{hour12:false})+"."+
+    String(d.getMilliseconds()).padStart(3,"0");
+}
+
+// ---------- categorize + label ----------
+var CATS = ["Crypto","Commodity","Index","FX","Equity","Other"];
+
+// Explicit map for the symbols Hyperliquid RWA dexs list. Keyed by the BARE
+// symbol (prefix stripped). value = [category, "TradFi equivalent label"].
+var TICKER_MAP = {
+  // ---- crypto (core perps) ----
+  "BTC":["Crypto","Bitcoin (BTCUSD / CME BTC)"],
+  "ETH":["Crypto","Ether (ETHUSD / CME ETH)"],
+  "SOL":["Crypto","Solana (SOLUSD)"],
+  // ---- indices ----
+  "XYZ100":["Index","Nasdaq-100 (NQ / QQQ)"],
+  "SP500":["Index","S&P 500 (ES / SPY)"],
+  "JP225":["Index","Nikkei 225 (NK / NKD)"],
+  "KR200":["Index","KOSPI 200"],
+  "NIFTY":["Index","Nifty 50 (India)"],
+  "IBOV":["Index","Bovespa (Brazil)"],
+  "VIX":["Index","CBOE Volatility (VIX)"],
+  "VOL":["Index","Volatility"],
+  "EWY":["Index","MSCI South Korea ETF (EWY)"],
+  "EWJ":["Index","MSCI Japan ETF (EWJ)"],
+  "EWT":["Index","MSCI Taiwan ETF (EWT)"],
+  "EWZ":["Index","MSCI Brazil ETF (EWZ)"],
+  // ---- commodities ----
+  "GOLD":["Commodity","Gold (XAUUSD / GC)"],
+  "SILVER":["Commodity","Silver (XAGUSD / SI)"],
+  "PLATINUM":["Commodity","Platinum (PL)"],
+  "PALLADIUM":["Commodity","Palladium (PA)"],
+  "COPPER":["Commodity","Copper (HG)"],
+  "ALUMINIUM":["Commodity","Aluminium (LME ALI)"],
+  "URANIUM":["Commodity","Uranium (U3O8)"],
+  "URNM":["Commodity","Uranium Miners ETF (URNM)"],
+  "CL":["Commodity","WTI Crude (CL)"],
+  "BRENTOIL":["Commodity","Brent Crude (BZ)"],
+  "NATGAS":["Commodity","Nat Gas (NG)"],
+  "TTF":["Commodity","Dutch TTF Gas"],
+  "CORN":["Commodity","Corn (ZC)"],
+  "WHEAT":["Commodity","Wheat (ZW)"],
+  "XLE":["Commodity","Energy Sector ETF (XLE)"],
+  // ---- FX ----
+  "DXY":["FX","US Dollar Index (DXY)"],
+  "EUR":["FX","EUR/USD"],
+  "JPY":["FX","USD/JPY"],
+  "GBP":["FX","GBP/USD"],
+  "KRW":["FX","USD/KRW"]
+};
+
+// isDex = asset comes from a builder dex (xyz etc.) which is overwhelmingly
+// single-name equities — so unmapped dex symbols default to Equity, while
+// unmapped core symbols stay Other.
+function classify(name, fullName, isDex){
+  var bare = name.replace(/^.*:/,"").toUpperCase();
+  if(TICKER_MAP[bare]) return TICKER_MAP[bare][0];
+  return isDex ? "Equity" : "Other";
+}
+
+function tradfiLabel(name, fullName, cat){
+  var bare = name.replace(/^.*:/,"").toUpperCase();
+  if(TICKER_MAP[bare]) return TICKER_MAP[bare][1];
+  if(cat==="Equity") return bare+(fullName&&fullName!==bare ? " ("+fullName+")" : " (stock)");
+  return bare+(fullName&&fullName!==bare ? " — "+fullName : "");
+}
+
+// ---------- discovery (REST over fetch — the info endpoint sends
+// access-control-allow-origin:* so this works from file:// with no CORS issue) ----------
+var discovered=false;
+
+function infoFetch(payload){
+  return fetch(INFO_URL,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(payload)}).then(function(r){
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      return r.json();
+    });
+}
+
+function startDiscovery(){
+  if(discovered){ subscribeAll(); return; }
+  setStatus("wait","Discovering markets…");
+  Promise.all([ infoFetch({type:"meta"}), infoFetch({type:"perpDexs"}) ])
+    .then(function(res){
+      var coreMeta=res[0], dexs=res[1];
+      // Core perps: keep the few with clean CME/spot equivalents.
+      var want={BTC:1,ETH:1,SOL:1};
+      ((coreMeta&&coreMeta.universe)||[]).forEach(function(c){
+        if(c&&want[c.name]&&!c.isDelisted) addRow(c.name,c.name,c.name,false);
+      });
+      // Builder dexs carry the RWA universe (equities, commodities, indices, FX).
+      var builders=(Array.isArray(dexs)?dexs:[]).filter(function(x){ return x&&x.name; });
+      return Promise.all(builders.map(function(x){
+        var full=x.fullName||x.full_name||x.name;
+        return infoFetch({type:"meta",dex:x.name}).then(function(m){
+          ((m&&m.universe)||[]).forEach(function(c){
+            if(!c||!c.name||c.isDelisted) return;
+            // c.name is ALREADY prefixed (e.g. "xyz:GOLD") — use it verbatim as
+            // both the row id and the WS subscription coin. Display name is bare.
+            addRow(c.name, c.name.replace(/^.*:/,""), full, true);
+          });
+        }).catch(function(e){ showErr("dex "+x.name+": "+e.message); });
+      }));
+    })
+    .then(finalizeDiscovery)
+    .catch(function(e){
+      showErr("discovery failed: "+e.message);
+      showBanner("Market discovery failed ("+e.message+"). Showing core crypto only — check your network/CORS.");
+      if(order.length===0){ ["BTC","ETH","SOL"].forEach(function(n){ addRow(n,n,n,false); }); }
+      finalizeDiscovery();
+    });
+}
+
+function addRow(id, name, fullName, isDex){
+  if(rows[id]) return;
+  var cat = classify(name, fullName, isDex);
+  rows[id] = { id:id, name:name, cat:cat,
+    label: tradfiLabel(name, fullName, cat),
+    tr:null, cells:null, ref:null, mid:null };
+  order.push(id);
+}
+
+function finalizeDiscovery(){
+  if(discovered) return;
+  discovered=true;
+  if(order.length>MAX_SUBS){
+    var total=order.length;
+    order=order.slice(0,MAX_SUBS);
+    var keep={}; order.forEach(function(id){ keep[id]=rows[id]; }); rows=keep;
+    showBanner("Discovered "+total+" coins; capped at "+MAX_SUBS+" subscriptions.");
+  }
+  if(order.length===0) showErr("no markets discovered");
+  buildLookup();
+  buildTable();
+  subscribeAll();
+}
+
+function subscribeAll(){
+  if(!ws||ws.readyState!==1) return;
+  setStatus("ok","Connected");
+  diag.acks=0; diag.books=0; diag.unmatched={}; renderDiag();
+  var i=0, BATCH=25;
+  (function pump(){
+    if(!ws||ws.readyState!==1) return;
+    var end=Math.min(i+BATCH, order.length);
+    for(; i<end; i++){
+      try{ ws.send(JSON.stringify({method:"subscribe",
+        subscription:{type:"l2Book",coin:order[i]}})); }catch(e){}
+    }
+    if(i<order.length) setTimeout(pump,120);
+  })();
+  setText("nSubs",order.length);
+}
+
+// ---------- table render ----------
+function buildTable(){
+  var tb=$("tbody"); tb.innerHTML="";
+  if(sortMode){ renderSorted(tb); return; }
+  CATS.forEach(function(cat){
+    var ids=order.filter(function(id){return rows[id].cat===cat;});
+    if(!ids.length) return;
+    var g=document.createElement("tr"); g.className="grp";
+    var gc=document.createElement("td"); gc.colSpan=10;
+    gc.textContent=cat+" ("+ids.length+")"; g.appendChild(gc); tb.appendChild(g);
+    ids.forEach(function(id){ tb.appendChild(makeRow(rows[id])); });
+  });
+}
+function renderSorted(tb){
+  var ids=order.slice().sort(function(a,b){
+    return Math.abs(basisOf(b)) - Math.abs(basisOf(a));
+  });
+  ids.forEach(function(id){ tb.appendChild(makeRow(rows[id])); });
+}
+function basisOf(id){
+  var r=rows[id]; if(!r||r.ref==null||r.mid==null||r.ref===0) return -1;
+  return (r.mid-r.ref)/r.ref*100;
+}
+
+function makeRow(r){
+  var tr=document.createElement("tr");
+  function cell(cls){ var td=document.createElement("td"); if(cls)td.className=cls; tr.appendChild(td); return td; }
+  var sym=cell("l sym"); sym.textContent=r.id;
+  var lab=cell("l ref"); lab.textContent=r.label; lab.title=r.label;
+  var bid=cell(), ask=cell(), mid=cell(), spr=cell(), sprp=cell();
+  var reftd=cell();
+    var inp=document.createElement("input");
+    inp.type="number"; inp.step="any"; inp.className="refbox"; inp.placeholder="ref";
+    if(r.ref!=null) inp.value=r.ref;
+    inp.addEventListener("input",function(){
+      var v=parseFloat(inp.value); r.ref=isFinite(v)?v:null; paintBasis(r);
+      if(sortMode) scheduleResort();
+    });
+    reftd.appendChild(inp);
+  var basis=cell(), upd=cell("muted");
+  r.tr=tr;
+  r.cells={bid:bid,ask:ask,mid:mid,spr:spr,sprp:sprp,basis:basis,upd:upd};
+  r.refInput=inp;
+  // repaint last-known values after a rebuild
+  if(r.mid!=null) paintQuote(r,true);
+  paintBasis(r);
+  return tr;
+}
+
+// Flash a price cell green on an uptick, red on a downtick, then let it fade.
+function tickCell(td,nv,ov){
+  if(td==null||nv==null||ov==null||nv===ov) return;
+  var cls = nv>ov ? "up" : "dn";
+  td.classList.remove("up","dn");
+  void td.offsetWidth;            // reflow so back-to-back ticks re-trigger
+  td.classList.add(cls);
+  setTimeout(function(){ td.classList.remove(cls); }, 90);
+}
+function paintQuote(r,noFlash){
+  var c=r.cells; if(!c) return;
+  if(!noFlash){
+    tickCell(c.bid,r.bid,r.pBid);
+    tickCell(c.ask,r.ask,r.pAsk);
+    tickCell(c.mid,r.mid,r.pMid);
+    tickCell(c.spr,r.spread,r.pSpread);
+    tickCell(c.sprp,r.spreadPct,r.pSpread);   // spread % tracks the same move
+  }
+  c.bid.textContent=fmtPx(r.bid); c.ask.textContent=fmtPx(r.ask);
+  c.mid.textContent=fmtPx(r.mid);
+  c.spr.textContent=fmtPx(r.spread);
+  c.sprp.textContent=fmtPct(r.spreadPct,3);
+  c.upd.textContent=r.updated||"—";
+  r.pBid=r.bid; r.pAsk=r.ask; r.pMid=r.mid; r.pSpread=r.spread;   // remember for next tick compare
+  paintBasis(r);
+}
+function paintBasis(r){
+  var c=r.cells; if(!c) return;
+  if(r.ref==null||r.ref===0||r.mid==null){
+    c.basis.textContent="—"; c.basis.className="muted"; return;
+  }
+  var b=(r.mid-r.ref)/r.ref*100;
+  c.basis.textContent=(b>=0?"+":"")+b.toFixed(3)+"%";
+  c.basis.className = b>=0 ? "pos" : "neg";
+}
+
+// ---------- websocket ----------
+function setStatus(kind,txt){
+  var p=$("status"); p.className="pill "+kind; setText("statusTxt",txt);
+}
+function liveCount(){
+  var n=0; for(var id in rows){ if(rows[id].mid!=null) n++; } return n;
+}
+
+function connect(){
+  setStatus("wait","Connecting…");
+  try{ ws=new WebSocket(WS_URL); }
+  catch(e){ showErr("WS create failed: "+e.message); return scheduleReconnect(); }
+
+  ws.onopen=function(){
+    backoff=1000;
+    showErr("");
+    if(discovered) subscribeAll();       // rows already known → (re)subscribe now
+    // else: REST discovery is in flight; finalizeDiscovery() will subscribe.
+    if(pingTimer) clearInterval(pingTimer);
+    pingTimer=setInterval(function(){
+      if(ws&&ws.readyState===1){ try{ws.send(JSON.stringify({method:"ping"}));}catch(e){} }
+    },PING_MS);
+  };
+
+  ws.onmessage=function(ev){
+    var msg; try{ msg=JSON.parse(ev.data); }catch(e){ return; }
+    if(!msg||!msg.channel) return;
+    if(msg.channel==="l2Book"){ handleBook(msg.data); }
+    else if(msg.channel==="subscriptionResponse"){ diag.acks++; renderDiag(); }
+    else if(msg.channel==="error"){ showErr("server: "+(msg.data||"").toString().slice(0,80)); }
+    // pong: ignore
+  };
+
+  ws.onerror=function(){ showErr("WebSocket error"); };
+  ws.onclose=function(){
+    setStatus("bad","Reconnecting…");
+    if(pingTimer){ clearInterval(pingTimer); pingTimer=null; }
+    scheduleReconnect();
+  };
+}
+
+function handleBook(d){
+  if(!d||d.coin==null||!d.levels) return;
+  diag.books++;
+  var id=resolveCoin(d.coin);
+  if(!id){ diag.unmatched[d.coin]=(diag.unmatched[d.coin]||0)+1; renderDiag(); return; }
+  var r=rows[id];
+  var bids=d.levels[0]||[], asks=d.levels[1]||[];
+  if(!bids.length||!asks.length) return;
+  var bid=parseFloat(bids[0].px), ask=parseFloat(asks[0].px);
+  if(!isFinite(bid)||!isFinite(ask)) return;
+  var first = (r.mid==null);
+  r.bid=bid; r.ask=ask; r.mid=(bid+ask)/2;
+  r.spread=ask-bid; r.spreadPct = r.mid? (r.spread/r.mid*100):null;
+  r.updated=nowHMS();
+  paintQuote(r,first);
+  setText("lastMsg",r.updated);
+  setText("nLive",liveCount());
+  renderDiag();
+}
+
+function renderDiag(){
+  var u=Object.keys(diag.unmatched);
+  var t="acks "+diag.acks+" · books "+diag.books;
+  if(u.length){ t+=" · UNMATCHED "+u.length+": "+u.slice(0,4).join(", ")+(u.length>4?"…":""); }
+  setText("diag", t);
+}
+
+function scheduleReconnect(){
+  setTimeout(connect, backoff);
+  backoff=Math.min(backoff*2,15000);
+}
+
+// ---------- sort toggle ----------
+function scheduleResort(){
+  if(sortTimer) return;
+  sortTimer=setTimeout(function(){ sortTimer=null; if(sortMode) buildTable(); },800);
+}
+$("sortBtn").addEventListener("click",function(){
+  sortMode=!sortMode;
+  this.classList.toggle("active",sortMode);
+  this.textContent = sortMode ? "Grouped view" : "Sort by |Basis %|";
+  buildTable();
+  if(sortMode){
+    if(window._sortInt) clearInterval(window._sortInt);
+    window._sortInt=setInterval(function(){ if(sortMode) buildTable(); },1500);
+  } else if(window._sortInt){ clearInterval(window._sortInt); window._sortInt=null; }
+});
+
+// ---------- boot ----------
+buildTable();      // empty shell; fills once discovery completes
+startDiscovery();  // REST: build the universe (independent of the socket)
+connect();         // WS: live top-of-book once subscribed
+</script>
+</body>
+</html>
