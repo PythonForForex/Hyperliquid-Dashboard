@@ -45,10 +45,6 @@
   .sym{font-weight:600}
   .ref{color:var(--dim);font-size:11.5px;max-width:280px;overflow:hidden;
     text-overflow:ellipsis}
-  input.refbox{width:96px;background:var(--bg);color:var(--txt);
-    border:1px solid var(--line);border-radius:5px;padding:3px 6px;
-    text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
-  input.refbox:focus{outline:none;border-color:var(--accent)}
   .pos{color:var(--green)} .neg{color:var(--red)} .muted{color:var(--dim)}
   tr.flash td{background:var(--flash);transition:background 0s}
   tbody td{transition:background .5s ease-out, color .5s ease-out}
@@ -76,15 +72,17 @@
     <th class="l">TradFi Equivalent</th>
     <th>Bid</th><th>Ask</th><th>Mid</th>
     <th>Spread</th><th>Spread %</th>
-    <th>TradFi Ref</th><th>Basis %</th>
+    <th>Oracle</th><th>Mark</th><th>Basis %</th><th>Funding APR</th>
     <th>Updated</th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table>
 <footer>
-  Mid = (bid+ask)/2 · Basis % = (Mid − TradFi Ref)/Ref × 100. Type the matching price
-  from your own broker/TradFi screen into <b>TradFi Ref</b> to see the live dislocation.
-  Data: api.hyperliquid.xyz · top-of-book only.
+  Mid = (bid+ask)/2 from top-of-book · <b>Oracle</b> = Hyperliquid's underlying reference
+  (the TradFi price for RWA assets) · <b>Mark</b> = HL fair value ·
+  <b>Basis %</b> = (Mark − Oracle)/Oracle × 100 — the perp's live premium/discount to the
+  underlying · <b>Funding APR</b> = hourly funding × 24 × 365 (annualized, paid long→short
+  when positive). Data: api.hyperliquid.xyz (l2Book + activeAssetCtx).
 </footer>
 
 <script>
@@ -103,7 +101,7 @@ function showErr(m){ $("err").textContent = m ? ("⚠ "+m) : ""; }
 function showBanner(m){ var b=$("banner"); b.textContent=m; b.style.display="block"; }
 
 // ---------- state ----------
-var rows = {};          // id -> {id,name,cat,label,tr,cells,ref,mid}
+var rows = {};          // id -> {id,name,cat,label,tr,cells,mid,oracle,mark,...}
 var order = [];         // array of ids in discovery order
 var lookup = {};        // normalized coin string -> row id (tolerant matching)
 var ws = null;
@@ -111,7 +109,7 @@ var pingTimer = null;
 var backoff = 1000;
 var sortMode = false;
 var sortTimer = null;
-var diag = {acks:0, books:0, unmatched:{}};  // self-diagnosis counters
+var diag = {acks:0, books:0, ctxs:0, unmatched:{}};  // self-diagnosis counters
 
 function norm(s){ return String(s).toLowerCase().replace(/\s+/g,""); }
 
@@ -269,7 +267,7 @@ function addRow(id, name, fullName, isDex){
   var cat = classify(name, fullName, isDex);
   rows[id] = { id:id, name:name, cat:cat,
     label: tradfiLabel(name, fullName, cat),
-    tr:null, cells:null, ref:null, mid:null };
+    tr:null, cells:null, mid:null, oracle:null, mark:null, funding:null };
   order.push(id);
 }
 
@@ -291,14 +289,17 @@ function finalizeDiscovery(){
 function subscribeAll(){
   if(!ws||ws.readyState!==1) return;
   setStatus("ok","Connected");
-  diag.acks=0; diag.books=0; diag.unmatched={}; renderDiag();
+  diag.acks=0; diag.books=0; diag.ctxs=0; diag.unmatched={}; renderDiag();
   var i=0, BATCH=25;
   (function pump(){
     if(!ws||ws.readyState!==1) return;
     var end=Math.min(i+BATCH, order.length);
     for(; i<end; i++){
+      // l2Book → live top-of-book; activeAssetCtx → oracle/mark/funding.
       try{ ws.send(JSON.stringify({method:"subscribe",
         subscription:{type:"l2Book",coin:order[i]}})); }catch(e){}
+      try{ ws.send(JSON.stringify({method:"subscribe",
+        subscription:{type:"activeAssetCtx",coin:order[i]}})); }catch(e){}
     }
     if(i<order.length) setTimeout(pump,120);
   })();
@@ -313,7 +314,7 @@ function buildTable(){
     var ids=order.filter(function(id){return rows[id].cat===cat;});
     if(!ids.length) return;
     var g=document.createElement("tr"); g.className="grp";
-    var gc=document.createElement("td"); gc.colSpan=10;
+    var gc=document.createElement("td"); gc.colSpan=12;
     gc.textContent=cat+" ("+ids.length+")"; g.appendChild(gc); tb.appendChild(g);
     ids.forEach(function(id){ tb.appendChild(makeRow(rows[id])); });
   });
@@ -325,8 +326,8 @@ function renderSorted(tb){
   ids.forEach(function(id){ tb.appendChild(makeRow(rows[id])); });
 }
 function basisOf(id){
-  var r=rows[id]; if(!r||r.ref==null||r.mid==null||r.ref===0) return -1;
-  return (r.mid-r.ref)/r.ref*100;
+  var r=rows[id]; if(!r||r.oracle==null||r.mark==null||r.oracle===0) return -1;
+  return (r.mark-r.oracle)/r.oracle*100;
 }
 
 function makeRow(r){
@@ -335,21 +336,13 @@ function makeRow(r){
   var sym=cell("l sym"); sym.textContent=r.id;
   var lab=cell("l ref"); lab.textContent=r.label; lab.title=r.label;
   var bid=cell(), ask=cell(), mid=cell(), spr=cell(), sprp=cell();
-  var reftd=cell();
-    var inp=document.createElement("input");
-    inp.type="number"; inp.step="any"; inp.className="refbox"; inp.placeholder="ref";
-    if(r.ref!=null) inp.value=r.ref;
-    inp.addEventListener("input",function(){
-      var v=parseFloat(inp.value); r.ref=isFinite(v)?v:null; paintBasis(r);
-      if(sortMode) scheduleResort();
-    });
-    reftd.appendChild(inp);
-  var basis=cell(), upd=cell("muted");
+  var oracle=cell(), mark=cell();
+  var basis=cell(), fund=cell(), upd=cell("muted");
   r.tr=tr;
-  r.cells={bid:bid,ask:ask,mid:mid,spr:spr,sprp:sprp,basis:basis,upd:upd};
-  r.refInput=inp;
+  r.cells={bid:bid,ask:ask,mid:mid,spr:spr,sprp:sprp,oracle:oracle,mark:mark,basis:basis,fund:fund,upd:upd};
   // repaint last-known values after a rebuild
   if(r.mid!=null) paintQuote(r,true);
+  if(r.mark!=null||r.oracle!=null) paintCtx(r,true);
   paintBasis(r);
   return tr;
 }
@@ -378,14 +371,35 @@ function paintQuote(r,noFlash){
   c.sprp.textContent=fmtPct(r.spreadPct,3);
   c.upd.textContent=r.updated||"—";
   r.pBid=r.bid; r.pAsk=r.ask; r.pMid=r.mid; r.pSpread=r.spread;   // remember for next tick compare
+}
+// Oracle / Mark come from the activeAssetCtx stream — paint + recompute basis.
+function paintCtx(r,noFlash){
+  var c=r.cells; if(!c) return;
+  if(!noFlash){
+    tickCell(c.oracle,r.oracle,r.pOracle);
+    tickCell(c.mark,r.mark,r.pMark);
+  }
+  c.oracle.textContent=fmtPx(r.oracle);
+  c.mark.textContent=fmtPx(r.mark);
+  c.upd.textContent=r.updated||"—";
+  r.pOracle=r.oracle; r.pMark=r.mark;
   paintBasis(r);
+  paintFunding(r);
+}
+// Funding is the hourly rate from ctx; show it annualized (× 24 × 365).
+function paintFunding(r){
+  var c=r.cells; if(!c) return;
+  if(r.funding==null||!isFinite(r.funding)){ c.fund.textContent="—"; c.fund.className="muted"; return; }
+  var apr=r.funding*24*365*100;
+  c.fund.textContent=(apr>=0?"+":"")+apr.toFixed(2)+"%";
+  c.fund.className = apr>=0 ? "pos" : "neg";
 }
 function paintBasis(r){
   var c=r.cells; if(!c) return;
-  if(r.ref==null||r.ref===0||r.mid==null){
+  if(r.oracle==null||r.oracle===0||r.mark==null){
     c.basis.textContent="—"; c.basis.className="muted"; return;
   }
-  var b=(r.mid-r.ref)/r.ref*100;
+  var b=(r.mark-r.oracle)/r.oracle*100;
   c.basis.textContent=(b>=0?"+":"")+b.toFixed(3)+"%";
   c.basis.className = b>=0 ? "pos" : "neg";
 }
@@ -395,7 +409,7 @@ function setStatus(kind,txt){
   var p=$("status"); p.className="pill "+kind; setText("statusTxt",txt);
 }
 function liveCount(){
-  var n=0; for(var id in rows){ if(rows[id].mid!=null) n++; } return n;
+  var n=0; for(var id in rows){ var r=rows[id]; if(r.mark!=null||r.mid!=null) n++; } return n;
 }
 
 function connect(){
@@ -418,6 +432,7 @@ function connect(){
     var msg; try{ msg=JSON.parse(ev.data); }catch(e){ return; }
     if(!msg||!msg.channel) return;
     if(msg.channel==="l2Book"){ handleBook(msg.data); }
+    else if(msg.channel==="activeAssetCtx"||msg.channel==="activeSpotAssetCtx"){ handleCtx(msg.data); }
     else if(msg.channel==="subscriptionResponse"){ diag.acks++; renderDiag(); }
     else if(msg.channel==="error"){ showErr("server: "+(msg.data||"").toString().slice(0,80)); }
     // pong: ignore
@@ -451,9 +466,28 @@ function handleBook(d){
   renderDiag();
 }
 
+// activeAssetCtx: {coin, ctx:{oraclePx, markPx, funding, ...}} — drives basis.
+function handleCtx(d){
+  if(!d||d.coin==null||!d.ctx) return;
+  diag.ctxs++;
+  var id=resolveCoin(d.coin);
+  if(!id){ diag.unmatched[d.coin]=(diag.unmatched[d.coin]||0)+1; renderDiag(); return; }
+  var r=rows[id], ctx=d.ctx;
+  var ora=parseFloat(ctx.oraclePx), mk=parseFloat(ctx.markPx), fr=parseFloat(ctx.funding);
+  var first=(r.mark==null&&r.oracle==null);
+  if(isFinite(ora)) r.oracle=ora;
+  if(isFinite(mk))  r.mark=mk;
+  if(isFinite(fr))  r.funding=fr;
+  r.updated=nowHMS();
+  paintCtx(r,first);
+  setText("lastMsg",r.updated);
+  setText("nLive",liveCount());
+  renderDiag();
+}
+
 function renderDiag(){
   var u=Object.keys(diag.unmatched);
-  var t="acks "+diag.acks+" · books "+diag.books;
+  var t="acks "+diag.acks+" · books "+diag.books+" · ctx "+diag.ctxs;
   if(u.length){ t+=" · UNMATCHED "+u.length+": "+u.slice(0,4).join(", ")+(u.length>4?"…":""); }
   setText("diag", t);
 }
@@ -464,10 +498,6 @@ function scheduleReconnect(){
 }
 
 // ---------- sort toggle ----------
-function scheduleResort(){
-  if(sortTimer) return;
-  sortTimer=setTimeout(function(){ sortTimer=null; if(sortMode) buildTable(); },800);
-}
 $("sortBtn").addEventListener("click",function(){
   sortMode=!sortMode;
   this.classList.toggle("active",sortMode);
